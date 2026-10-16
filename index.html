@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Truck Plan Reports System</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+body{font-family:Segoe UI,Arial,sans-serif;background:#f5f7fa;margin:0;padding:20px}
+.container{max-width:1300px;margin:auto}
+.card{background:#fff;padding:20px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,.1)}
+h1{color:#1565c0;margin-top:0}
+label{font-weight:bold;display:block;margin-top:10px}
+input[type=file]{width:100%;padding:8px;margin-top:5px;box-sizing:border-box}
+.opt{font-weight:normal;margin-top:12px}
+button{background:#1565c0;color:#fff;border:none;padding:12px 16px;border-radius:6px;cursor:pointer;margin-right:10px;margin-top:15px}
+button:hover{background:#0d47a1}
+#log{margin-top:20px;height:200px;overflow:auto;background:#f3f3f3;border-radius:6px;padding:10px;font-size:13px}
+.wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;margin-top:20px;font-size:12px}
+th{background:#1565c0;color:#fff;padding:6px;border:1px solid #ccc;white-space:nowrap}
+td{padding:6px;border:1px solid #ddd}
+tr.un td{background:#fff3e0}
+tr.sp td{background:#e8f5e9}
+.sum{margin-top:15px;font-size:14px}
+</style>
+</head>
+<body>
+<div class="container"><div class="card">
+<h1>Truck Plan Reports System</h1>
+
+<label>Draft Transfer Order Listing Report (sheet: Agent Order)</label>
+<input type="file" id="reportFile" accept=".xlsx,.xls">
+
+<label>Report: Transport Plan</label>
+<input type="file" id="transportFile" accept=".xlsx,.xls">
+
+<label class="opt"><input type="checkbox" id="fallback"> If no match by To Code + TQ No + TSO Nº + Item Nº, try To Code + Item Nº only</label>
+
+<button onclick="processFiles()">Process Files</button>
+<button onclick="downloadResult()">Download Excel</button>
+
+<div id="log"></div>
+<div class="sum" id="summary"></div>
+<div class="wrap" id="preview"></div>
+</div></div>
+
+<script>
+let outRows=[], outHeaders=[], leftover=[], outFlags=[], summaryRows=[], totals=null;
+
+function log(msg,color="black"){
+  const b=document.getElementById("log");
+  const d=document.createElement("div");
+  d.style.color=color; d.textContent=msg;
+  b.appendChild(d); b.scrollTop=b.scrollHeight;
+}
+function esc(s){return String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+
+// "TSO Nº" / "TSO No" / "tso no." all become "tsono"
+function normH(v){
+  return String(v??"").toLowerCase().replace(/[º°]/g,"o").replace(/[^a-z0-9]/g,"");
+}
+function norm(v){return String(v??"").trim().toLowerCase().replace(/\s+/g," ");}
+function num(v){
+  if(typeof v==="number") return v;
+  return parseFloat(String(v??"").replace(/,/g,""))||0;
+}
+
+const ALIASES={
+  status:["status"],
+  toCode:["tocode"],
+  tq:["tqno","tq"],
+  tso:["tsono","tso"],
+  item:["itemno","item"],
+  order:["order","qty","orderqty"],
+  remaining:["remaining"],
+  truck:["trucknumber","truckno","truck","trucknº"]
+};
+function findCol(headers,key){
+  const wanted=ALIASES[key];
+  for(const w of wanted){
+    const i=headers.findIndex(h=>normH(h)===w);
+    if(i>=0) return headers[i];
+  }
+  return null;
+}
+
+// Read one sheet as rows with the header row detected (header row = first row that contains "To Code")
+function readSheet(wb,preferName){
+  let names=wb.SheetNames, pick=null;
+  if(preferName){
+    pick=names.find(n=>normH(n)===normH(preferName));
+  }
+  return pick?[pick]:names;
+}
+function sheetToTable(ws){
+  const aoa=XLSX.utils.sheet_to_json(ws,{header:1,defval:"",raw:true});
+  let hi=aoa.findIndex((r,i)=>i<15&&r.some(c=>normH(c)==="tocode"));
+  if(hi<0) return null;
+  const headers=aoa[hi].map(h=>String(h).trim());
+  const rows=[];
+  for(let i=hi+1;i<aoa.length;i++){
+    const r=aoa[i];
+    if(!r.some(c=>String(c).trim()!=="")) continue;
+    const o={};
+    headers.forEach((h,j)=>{ if(h!=="") o[h]=r[j]??""; });
+    rows.push(o);
+  }
+  return {headers:headers.filter(h=>h!==""),rows,sheetName:null};
+}
+
+function readExcel(file,preferName,needTruck){
+  return new Promise((resolve,reject)=>{
+    const rd=new FileReader();
+    rd.onerror=reject;
+    rd.onload=e=>{
+      try{
+        const wb=XLSX.read(e.target.result,{type:"array"});
+        const cands=readSheet(wb,preferName);
+        let found=null;
+        for(const n of cands){
+          const t=sheetToTable(wb.Sheets[n]);
+          if(!t) continue;
+          if(needTruck && !findCol(t.headers,"truck")) continue;
+          t.sheetName=n; found=t; break;
+        }
+        if(!found&&preferName){ // fall back to any sheet
+          for(const n of wb.SheetNames){
+            const t=sheetToTable(wb.Sheets[n]);
+            if(t){t.sheetName=n;found=t;break;}
+          }
+        }
+        resolve(found);
+      }catch(err){reject(err);}
+    };
+    rd.readAsArrayBuffer(file);
+  });
+}
+
+async function processFiles(){
+  if(typeof XLSX==="undefined"){alert("XLSX library failed to load");return;}
+  document.getElementById("log").innerHTML="";
+  document.getElementById("preview").innerHTML="";
+  document.getElementById("summary").innerHTML="";
+  outRows=[];outHeaders=[];leftover=[];outFlags=[];summaryRows=[];totals=null;
+
+  const rf=document.getElementById("reportFile").files[0];
+  const tf=document.getElementById("transportFile").files[0];
+  if(!rf||!tf){alert("Please select both files.");return;}
+
+  try{
+    log("Loading Excel files...","blue");
+    const rep=await readExcel(rf,"Agent Order",false);
+    const tp =await readExcel(tf,null,true);
+    if(!rep){log("Report: header row with 'To Code' not found.","red");return;}
+    if(!tp){log("Transport Plan: no sheet with 'To Code' and Truck Nº columns found.","red");return;}
+    log(`Report sheet: "${rep.sheetName}" (${rep.rows.length} rows) | Transport sheet: "${tp.sheetName}" (${tp.rows.length} rows)`,"green");
+
+    // ---- column detection (stop with a clear message if something is missing)
+    const R={}, T={};
+    ["status","toCode","tq","tso","item","order","remaining","truck"].forEach(k=>R[k]=findCol(rep.headers,k));
+    ["toCode","tq","tso","item","order","truck"].forEach(k=>T[k]=findCol(tp.headers,k));
+
+    const missR=["status","toCode","item","order"].filter(k=>!R[k]);
+    const missT=["toCode","item","order","truck"].filter(k=>!T[k]);
+    if(missR.length){log("Report missing column(s): "+missR.join(", "),"red");return;}
+    if(missT.length){log("Transport Plan missing column(s): "+missT.join(", "),"red");return;}
+    if(!R.remaining) log("Report has no 'Remaining' column - Remaining will not be updated.","orange");
+    log("Header detection completed.","green");
+
+    const useTQ  = R.tq && T.tq;
+    const useTSO = R.tso && T.tso;
+    if(!useTQ)  log("TQ No not available in both files - skipped in matching.","orange");
+    if(!useTSO) log("TSO Nº not available in both files - skipped in matching.","orange");
+
+    const truckCol=R.truck||"Truck Nº";
+    outHeaders=[...rep.headers];
+    if(!R.truck) outHeaders.push(truckCol);
+    const noteCol="Allocation Note";
+    outHeaders.push(noteCol);
+
+    // ---- transport pools
+    const fullPool={}, itemPool={};
+    const lines=[];
+    tp.rows.forEach((row,idx)=>{
+      const q=num(row[T.order]);
+      if(q<=0) return;
+      const ln={truck:row[T.truck],left:q,orig:q,row,idx,
+                toCode:row[T.toCode],item:row[T.item],
+                tq:T.tq?row[T.tq]:"",tso:T.tso?row[T.tso]:""};
+      lines.push(ln);
+      const kf=[norm(ln.toCode),useTQ?norm(ln.tq):"",useTSO?norm(ln.tso):"",norm(ln.item)].join("|");
+      const ki=norm(ln.toCode)+"|"+norm(ln.item);
+      (fullPool[kf]=fullPool[kf]||[]).push(ln);
+      (itemPool[ki]=itemPool[ki]||[]).push(ln);
+    });
+
+    const allowFallback=document.getElementById("fallback").checked;
+    let nRel=0,nExact=0,nSplit=0,nUn=0,nSkip=0;
+    const byAgent={};
+
+    rep.rows.forEach(row=>{
+      const isRel=norm(row[R.status]).includes("release");
+      if(!isRel){ nSkip++; pushRow(row,"",null); return; }
+      nRel++;
+
+      const orderQty=num(row[R.order]);
+      if(orderQty<=0){ pushRow(row,"Order qty is 0",null); return; }
+
+      const kf=[norm(row[R.toCode]),useTQ?norm(row[R.tq]):"",useTSO?norm(row[R.tso]):"",norm(row[R.item])].join("|");
+      let pool=(fullPool[kf]||[]).slice();
+      let via="";
+      if(allowFallback){
+        const extra=(itemPool[norm(row[R.toCode])+"|"+norm(row[R.item])]||[]).filter(l=>!pool.includes(l));
+        pool=pool.concat(extra);
+      }
+
+      // 1) exact qty match -> import Truck Nº directly, no split
+      const exact=pool.find(l=>l.left>0&&l.left===orderQty)
+                 || pool.find(l=>l.left>0&&l.orig===orderQty&&l.left>=orderQty);
+      if(exact&&exact.left>=orderQty){
+        exact.left-=orderQty;
+        nExact++;
+        acc(row,orderQty,orderQty,[exact.truck]);
+        pushRow(row,"Matched",exact.truck,{order:orderQty,rem:num(row[R.remaining])});
+        return;
+      }
+
+      // 2) allocation: split by truck lines, split rows add up to Order qty
+      let balance=orderQty, remLeft=R.remaining?num(row[R.remaining]):0;
+      const parts=[];
+      for(const l of pool){
+        if(balance<=0) break;
+        if(l.left<=0) continue;
+        const a=Math.min(balance,l.left);
+        l.left-=a; balance-=a;
+        parts.push({truck:l.truck,qty:a});
+      }
+      acc(row,orderQty,orderQty-balance,parts.map(p=>p.truck));
+      parts.forEach((p,i)=>{
+        const rem=R.remaining?Math.min(remLeft,p.qty):0;
+        remLeft-=rem;
+        pushRow(row,parts.length>1?`Split ${i+1}/${parts.length}`:"Allocated",p.truck,{order:p.qty,rem:rem},parts.length>1?"sp":"");
+      });
+      if(parts.length>1) nSplit++; else if(parts.length===1) nExact++;
+
+      // 3) qty still without a truck -> keep for next time
+      if(balance>0){
+        nUn++;
+        const rem=R.remaining?Math.min(remLeft,balance):0;
+        pushRow(row,parts.length?"No truck for this qty - keep for next":"No matching truck - keep for next","",{order:balance,rem:rem},"un");
+      }
+    });
+
+    function acc(src,ordered,allocated,trucks){
+      const k=String(src[R.toCode]??"").trim();
+      const a=byAgent[k]=byAgent[k]||{"To Code":k,"Released Rows":0,"Order Qty":0,"Allocated Qty":0,"Not Allocated Qty":0,"Trucks":new Set()};
+      a["Released Rows"]++; a["Order Qty"]+=ordered; a["Allocated Qty"]+=allocated;
+      a["Not Allocated Qty"]+=ordered-allocated;
+      trucks.forEach(t=>{ if(String(t).trim()!=="") a.Trucks.add(String(t).trim()); });
+    }
+    function pushRow(src,note,truck,qtys,flag){
+      const o={...src};
+      if(qtys){
+        o[R.order]=qtys.order;
+        if(R.remaining) o[R.remaining]=qtys.rem;
+      }
+      if(truck!==null) o[truckCol]=truck;
+      o[noteCol]=note;
+      outRows.push(o); outFlags.push(flag||"");
+    }
+
+    // truck qty not used by any report row -> keep for next time
+    lines.forEach(l=>{
+      if(l.left>0) leftover.push({
+        "To Code":l.toCode,"TQ No":l.tq,"TSO Nº":l.tso,"Item Nº":l.item,
+        "Truck Nº":l.truck,"Plan Qty":l.orig,"Qty Not Used":l.left
+      });
+    });
+
+    summaryRows=Object.values(byAgent).map(a=>({
+      "To Code":a["To Code"],"Released Rows":a["Released Rows"],"Order Qty":a["Order Qty"],
+      "Allocated Qty":a["Allocated Qty"],"Not Allocated Qty":a["Not Allocated Qty"],
+      "Trucks Used":a.Trucks.size,
+      "% Allocated":a["Order Qty"]?Math.round(a["Allocated Qty"]/a["Order Qty"]*1000)/10:0
+    })).sort((x,y)=>String(x["To Code"]).localeCompare(String(y["To Code"])));
+    const sum=k=>summaryRows.reduce((t,r)=>t+r[k],0);
+    const unusedTruckQty=leftover.reduce((t,r)=>t+r["Qty Not Used"],0);
+    totals={nRel,nExact,nSplit,nUn,nSkip,rowsOut:outRows.length,
+            order:sum("Order Qty"),alloc:sum("Allocated Qty"),notAlloc:sum("Not Allocated Qty"),
+            unusedTruckQty,
+            pct:sum("Order Qty")?Math.round(sum("Allocated Qty")/sum("Order Qty")*1000)/10:0};
+    log(`Released rows: ${nRel} | matched/allocated: ${nExact} | split: ${nSplit} | not fully allocated: ${nUn} | not released (kept unchanged): ${nSkip}`,"green");
+    log(`Output rows: ${outRows.length} | Transport lines with qty left: ${leftover.length}`,"green");
+    renderSummary();
+    renderPreview();
+  }catch(err){
+    log("Error: "+err.message,"red");
+    console.error(err);
+  }
+}
+
+function renderSummary(){
+  const t=totals; if(!t) return;
+  const box=(l,v,c)=>`<div style="flex:1;min-width:150px;background:#f5f7fa;border-left:4px solid ${c};padding:10px;border-radius:6px"><div style="font-size:12px;color:#555">${l}</div><div style="font-size:20px;font-weight:bold">${v}</div></div>`;
+  let h=`<h3 style="margin:0 0 10px">Summary Result</h3><div style="display:flex;flex-wrap:wrap;gap:10px">`
+   +box("Released rows",t.nRel,"#1565c0")
+   +box("Matched (no split)",t.nExact,"#2e7d32")
+   +box("Split rows",t.nSplit,"#2e7d32")
+   +box("Not fully allocated",t.nUn,"#ef6c00")
+   +box("Order Qty",t.order.toLocaleString(),"#1565c0")
+   +box("Allocated Qty",t.alloc.toLocaleString()+" ("+t.pct+"%)","#2e7d32")
+   +box("Not Allocated Qty",t.notAlloc.toLocaleString(),"#ef6c00")
+   +box("Truck qty not used",t.unusedTruckQty.toLocaleString(),"#6a1b9a")
+   +`</div>`;
+  if(summaryRows.length){
+    const cols=Object.keys(summaryRows[0]);
+    h+="<table><tr>"+cols.map(c=>`<th>${esc(c)}</th>`).join("")+"</tr>";
+    summaryRows.forEach(r=>{
+      h+=`<tr class="${r["Not Allocated Qty"]>0?"un":""}">`+cols.map(c=>`<td>${esc(typeof r[c]==="number"?r[c].toLocaleString():r[c])}</td>`).join("")+"</tr>";
+    });
+    h+="</table>";
+  }
+  h+=`<div class="sum">Detail below: green = split, orange = quantity without truck (keep for next).</div>`;
+  document.getElementById("summary").innerHTML=h;
+}
+
+function renderPreview(){
+  if(!outRows.length) return;
+  let h="<table><tr>"+outHeaders.map(c=>`<th>${esc(c)}</th>`).join("")+"</tr>";
+  outRows.slice(0,50).forEach((r,i)=>{
+    h+=`<tr class="${outFlags[i]}">`+outHeaders.map(c=>`<td>${esc(r[c])}</td>`).join("")+"</tr>";
+  });
+  h+="</table>";
+  if(outRows.length>50) h+=`<div class="sum">Showing first 50 of ${outRows.length} rows. Download for the full result.</div>`;
+  document.getElementById("preview").innerHTML=h;
+}
+
+function downloadResult(){
+  if(!outRows.length){alert("No processed data.");return;}
+  const wb=XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(outRows,{header:outHeaders}),"Agent Order");
+  if(summaryRows.length){
+    const tot={"To Code":"TOTAL","Released Rows":totals.nRel,"Order Qty":totals.order,"Allocated Qty":totals.alloc,
+               "Not Allocated Qty":totals.notAlloc,"Trucks Used":"","% Allocated":totals.pct};
+    XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet([...summaryRows,tot]),"Summary");
+  }
+  if(leftover.length){
+    XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(leftover),"Truck Qty Left");
+  }
+  XLSX.writeFile(wb,"Draft Transfer Order Result.xlsx");
+}
+</script>
+</body>
+</html>
